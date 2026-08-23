@@ -1,0 +1,118 @@
+# .github/workflows/release.yml
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write # Required to create releases
+
+jobs:
+  release:
+    name: ${{ matrix.config.name }}
+    runs-on: ${{ matrix.config.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        config:
+          - { name: "Windows MSVC x64", ext: "windows-msvc-x86_64", os: windows-latest, cc: "cl", cxx: "cl", environment_script: "C:/Program Files/Microsoft Visual Studio/2022/Enterprise/VC/Auxiliary/Build/vcvars64.bat", vcpkg_triplet: x64-windows-static }
+          - { name: "Windows MSVC i686", ext: "windows-msvc-i686", os: windows-latest, cc: "cl", cxx: "cl", environment_script: "C:/Program Files/Microsoft Visual Studio/2022/Enterprise/VC/Auxiliary/Build/vcvars32.bat", vcpkg_triplet: x86-windows-static }
+          - { name: "Ubuntu GCC", ext: "linux", os: ubuntu-24.04, cc: "gcc", cxx: "g++", vcpkg_triplet: x64-linux-release }
+          - { name: "macOS Clang", ext: "macos", os: macos-latest, cc: "clang", cxx: "clang++", vcpkg_triplet: x64-osx-release }
+
+    defaults:
+      run:
+        working-directory: ./
+        shell: bash
+
+    steps:
+      - uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332 # v4.1.7
+        with:
+          submodules: "true"
+          path: project
+
+      - name: Install Ninja
+        run: |
+          if [ "$RUNNER_OS" == "Linux" ]; then sudo apt-get install -y ninja-build rpm
+          elif [ "$RUNNER_OS" == "Windows" ]; then choco install ninja
+          elif [ "$RUNNER_OS" == "macOS" ]; then brew install ninja; fi
+
+      - name: Install NSIS & WiX Toolset
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          iwr -useb get.scoop.sh -outfile 'install.ps1'
+          .\install.ps1 -RunAsAdmin
+          scoop update
+          scoop bucket add extras
+          scoop install nsis wixtoolset
+
+      - name: Configure & Build Release
+        env:
+          CC: ${{ matrix.config.cc }}
+          CXX: ${{ matrix.config.cxx }}
+          ENVIRONMENT_SCRIPT: ${{ matrix.config.environment_script }}
+          BUILD_TYPE: Release
+        working-directory: project
+        run: |
+          chmod a+x ./.github/scripts/*.cmake
+          cmake -P ./.github/scripts/configure.cmake
+          cmake -P ./.github/scripts/build.cmake
+
+      - name: Install Strip
+        working-directory: project
+        run: cmake --install build --prefix instdir --strip --config Release
+
+      - name: Generate artifact name
+        id: generate-name
+        shell: cmake -P {0}
+        working-directory: project
+        run: |
+          execute_process(COMMAND cmake --system-information WORKING_DIRECTORY build OUTPUT_VARIABLE sysInfo)
+          string(REGEX MATCH "CMAKE_PROJECT_NAME:STATIC=([^\n]*)" projectName ${sysInfo})
+          set(projectName ${CMAKE_MATCH_1})
+          string(REGEX MATCH "CMAKE_PROJECT_VERSION:STATIC=([^\n]*)" projectVersion ${sysInfo})
+          set(projectVersion ${CMAKE_MATCH_1})
+          set(finalName "${projectName}_${projectVersion}")
+          file(APPEND "$ENV{GITHUB_OUTPUT}" "finalName=${finalName}\n")
+          file(APPEND "$ENV{GITHUB_OUTPUT}" "ext=${{ matrix.config.ext }}\n")
+
+      - name: Pack Archive
+        working-directory: project/instdir
+        run: cmake -E tar cfv ../${{ steps.generate-name.outputs.finalName }}_${{ steps.generate-name.outputs.ext }}.7z --format=7zip .
+
+      - name: Pack Windows Installer
+        if: runner.os == 'Windows'
+        working-directory: project/build
+        run: |
+          if [[ ${{ matrix.config.ext }} =~ "i686" ]]; then cpack -C Release -G NSIS
+          else cpack -C Release -G NSIS64; fi
+          cpack -C Release -G WIX
+
+      - name: Pack Linux DEB & RPM
+        if: runner.os == 'Linux'
+        working-directory: project/build
+        run: |
+          cpack -C Release -G DEB
+          cpack -C Release -G RPM
+
+      - name: Pack MacOS DMG
+        if: runner.os == 'macOS'
+        working-directory: project/build
+        run: cpack -C Release -G DragNDrop
+
+      - name: Upload Artifacts to Release
+        uses: softprops/action-gh-release@c062e08bd532815e2085a804c0b76f80d45a924f # v2.0.4 SHA
+        with:
+          name: Release ${{ github.ref_name }}
+          draft: false
+          prerelease: false
+          files: |
+            ./project/*.7z
+            ./project/build/package/*.exe
+            ./project/build/package/*.msi
+            ./project/build/package/*.deb
+            ./project/build/package/*.rpm
+            ./project/build/package/*.dmg

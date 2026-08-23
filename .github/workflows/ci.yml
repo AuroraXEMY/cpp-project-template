@@ -1,0 +1,167 @@
+# .github/workflows/ci.yml
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.config.name }} - ${{ matrix.build_type }}
+    runs-on: ${{ matrix.config.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        build_type: [Debug, Release]
+        config:
+          - { name: "Ubuntu GCC", os: ubuntu-24.04, cc: "gcc", cxx: "g++", vcpkg_triplet: x64-linux }
+          - { name: "macOS Clang", os: macos-latest, cc: "clang", cxx: "clang++", vcpkg_triplet: x64-osx }
+          - { name: "Windows MSVC x64", os: windows-latest, cc: "cl", cxx: "cl", environment_script: "C:/Program Files/Microsoft Visual Studio/2022/Enterprise/VC/Auxiliary/Build/vcvars64.bat", vcpkg_triplet: x64-windows }
+          - { name: "Windows MSVC i686", os: windows-latest, cc: "cl", cxx: "cl", environment_script: "C:/Program Files/Microsoft Visual Studio/2022/Enterprise/VC/Auxiliary/Build/vcvars32.bat", vcpkg_triplet: x86-windows }
+          - { name: "Windows LLVM x64", os: windows-latest, cc: "clang", cxx: "clang++", vcpkg_triplet: x64-win-llvm }
+          - { name: "Windows MinGW x64", os: windows-latest, cc: "gcc", cxx: "g++", vcpkg_triplet: x64-mingw-dynamic }
+          - { name: "Windows MinGW i686", os: windows-latest, cc: "gcc", cxx: "g++", vcpkg_triplet: x86-mingw-dynamic }
+
+    defaults:
+      run:
+        working-directory: ./
+        shell: bash
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332 # v4.1.7
+        with:
+          submodules: "true"
+          path: project
+
+      - name: Update Ubuntu package list
+        if: runner.os == 'Linux'
+        run: sudo apt-get update
+
+      - name: Install Ninja & ccache
+        run: |
+          if [ "$RUNNER_OS" == "Linux" ]; then
+            sudo apt-get install -y ninja-build ccache lcov valgrind libwxgtk3.2-dev libgtest-dev
+          elif [ "$RUNNER_OS" == "Windows" ]; then
+            choco install ninja ccache
+          elif [ "$RUNNER_OS" == "macOS" ]; then
+            brew install ninja ccache wxwidgets googletest
+          fi
+
+      - name: Install code coverage tool
+        if: matrix.config.name == 'Windows MSVC x64' && matrix.build_type == 'Debug'
+        run: choco install opencppcoverage
+
+      - name: Get LLVM vcpkg triplets
+        if: runner.os == 'Windows'
+        uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332 # v4.1.7
+        with:
+          repository: 'Neumann-A/my-vcpkg-triplets'
+          path: './my-vcpkg-triplets'
+
+      - name: vcpkg
+        id: vcpkg
+        if: runner.os == 'Windows'
+        uses: johnwason/vcpkg-action@b8a44783421069f882125301081682167011754b # master SHA
+        env:
+          VCPKG_MANIFEST_MODE: OFF
+        with:
+          pkgs: wxwidgets gtest
+          triplet: ${{ matrix.config.vcpkg_triplet }}
+          extra-args: --overlay-triplets=${{ github.workspace }}/my-vcpkg-triplets
+          cache-key: ${{ matrix.config.name }}-${{ matrix.build_type }}
+          revision: master
+          token: ${{ github.token }}
+
+      - name: ccache cache files
+        uses: actions/cache@0c45773b623bea5c3f28bb67f60b74c3d0633222 # v4.0.2
+        with:
+          path: .ccache
+          key: ${{ runner.os }}-${{ matrix.config.name }}-${{ matrix.build_type }}-ccache-${{ hashFiles('**/CMakeLists.txt', '**/vcpkg.json') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.config.name }}-${{ matrix.build_type }}-ccache-
+
+      - name: Configure
+        env:
+          CC: ${{ matrix.config.cc }}
+          CXX: ${{ matrix.config.cxx }}
+          ENVIRONMENT_SCRIPT: ${{ matrix.config.environment_script }}
+          RUNNER_OS: ${{ runner.os }}
+          VCPKG_TRIPLET: ${{ matrix.config.vcpkg_triplet }}
+          BUILD_TYPE: ${{ matrix.build_type }}
+        working-directory: project
+        run: |
+          chmod a+x ./.github/scripts/*.cmake
+          cmake -P ./.github/scripts/configure.cmake
+
+      - name: Build
+        env:
+          CXX: ${{ matrix.config.cxx }}
+          ENVIRONMENT_SCRIPT: ${{ matrix.config.environment_script }}
+          RUNNER_OS: ${{ runner.os }}
+          BUILD_TYPE: ${{ matrix.build_type }}
+        working-directory: project
+        run: |
+          cmake -P ./.github/scripts/build.cmake
+
+      - name: Run tests
+        env:
+          CC: ${{ matrix.config.cc }}
+          CXX: ${{ matrix.config.cxx }}
+          RUNNER_OS: ${{ runner.os }}
+          BUILD_TYPE: ${{ matrix.build_type }}
+        working-directory: project
+        run: cmake -P ./.github/scripts/test.cmake
+
+      - name: Upload coverage reports to Codecov
+        uses: codecov/codecov-action@e28ff129e5458c3803b5a0b916302891229196b3 # v4.5.0
+        if: runner.os == 'Linux' && matrix.build_type == 'Debug'
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+
+      - name: Coveralls GitHub Action
+        uses: threeal/gcovr-action@b1c128180973589e608f265409361b22f94341f3 # v1.1.0 SHA
+        if: runner.os == 'Linux' && matrix.build_type == 'Debug'
+        with:
+          root: project
+          coveralls-send: true
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+  # Coverity is strictly manual now
+  coverity:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    needs: build
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332 # v4.1.7
+        with:
+          submodules: "true"
+          path: project
+          
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y ninja-build libwxgtk3.2-dev libgtest-dev
+        
+      - name: Clean build directory for Coverity scan
+        working-directory: project/build
+        run: |
+          cmake --build . --target clean || true
+          find . -name "*.gcda" -type f -delete || true
+          
+      - name: Coverity scan
+        uses: vapier/coverity-scan-action@b8b2743157805d9798343d1701341818170701d4 # v1 SHA
+        with:
+          email: ${{ secrets.COVERITY_SCAN_EMAIL }}
+          token: ${{ secrets.COVERITY_SCAN_TOKEN }}
+          working-directory: project/build
+          command: 'ninja'
