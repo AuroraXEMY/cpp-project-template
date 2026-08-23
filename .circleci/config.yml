@@ -1,0 +1,21 @@
+version: 2.1
+
+jobs:
+  build:
+    docker:
+      - image: cimg/gcc:latest
+        auth:
+          username: $DOCKERHUB_USERNAME
+          password: $DOCKERHUB_PASSWORD
+    steps:
+      - checkout
+      - run: sudo apt-get update && sudo apt-get install -y ninja-build
+      - run: cmake -S . -B build -D CMAKE_BUILD_TYPE=Debug -G "Ninja"
+      - run: cmake --build build
+      - run: cd build && ctest --output-on-failure
+
+workflows:
+  version: 2
+  build_and_test:
+    jobs:
+      - build
